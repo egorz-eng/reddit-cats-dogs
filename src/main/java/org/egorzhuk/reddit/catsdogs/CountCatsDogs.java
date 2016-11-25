@@ -4,28 +4,31 @@ import com.google.api.client.googleapis.auth.oauth2.GoogleCredential;
 import com.google.api.client.googleapis.javanet.GoogleNetHttpTransport;
 import com.google.api.client.json.jackson2.JacksonFactory;
 import com.google.api.client.util.IOUtils;
+import com.google.api.services.bigquery.model.TableFieldSchema;
 import com.google.api.services.bigquery.model.TableRow;
+import com.google.api.services.bigquery.model.TableSchema;
 import com.google.api.services.vision.v1.Vision;
 import com.google.api.services.vision.v1.VisionScopes;
 import com.google.api.services.vision.v1.model.*;
 import com.google.cloud.dataflow.sdk.Pipeline;
 import com.google.cloud.dataflow.sdk.io.BigQueryIO;
-import com.google.cloud.dataflow.sdk.io.TextIO;
-import com.google.cloud.dataflow.sdk.options.*;
+import com.google.cloud.dataflow.sdk.options.DataflowPipelineOptions;
+import com.google.cloud.dataflow.sdk.options.Default;
+import com.google.cloud.dataflow.sdk.options.Description;
+import com.google.cloud.dataflow.sdk.options.PipelineOptionsFactory;
 import com.google.cloud.dataflow.sdk.repackaged.com.google.common.collect.ImmutableList;
 import com.google.cloud.dataflow.sdk.transforms.Count;
 import com.google.cloud.dataflow.sdk.transforms.DoFn;
 import com.google.cloud.dataflow.sdk.transforms.ParDo;
-import com.google.cloud.dataflow.sdk.util.gcsfs.GcsPath;
 import com.google.cloud.dataflow.sdk.values.KV;
 import com.google.cloud.dataflow.sdk.values.PCollection;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.MalformedURLException;
 import java.net.URL;
 import java.security.GeneralSecurityException;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -33,7 +36,8 @@ import java.util.List;
  */
 public class CountCatsDogs {
 
-    public static final String REDDIT_IMGUR_CATS_DOGS = "bq-playground-1366:reddit.imgur_cats_dogs";
+    static final String REDDIT_IMGUR_CATS_DOGS = "bq-playground-1366:reddit.imgur_cats_dogs";
+    static final String REDDIT_IMGUR_CATS_DOGS_RES = "bq-playground-1366:reddit.cats_dogs_result";
 
     public static void main(String[] args) {
         //Read cmd arguments and use custom options
@@ -41,10 +45,19 @@ public class CountCatsDogs {
         //create pipeline
         final Pipeline pipeline = Pipeline.create(options);
 
+        // Build the table schema for the output table.
+        List<TableFieldSchema> fields = new ArrayList<>();
+        fields.add(new TableFieldSchema().setName("description").setType("STRING"));
+        fields.add(new TableFieldSchema().setName("count").setType("INTEGER"));
+        TableSchema schema = new TableSchema().setFields(fields);
+
         pipeline.apply(BigQueryIO.Read.from(options.getInput()))
                 .apply(new CountLabels())
-                .apply(ParDo.of(new FormatAsTextFn()))
-                .apply(TextIO.Write.named("Cats&Dogs").to(options.getOutput()));
+                .apply(BigQueryIO.Write
+                        .to(options.getOutput())
+                        .withSchema(schema)
+                        .withCreateDisposition(BigQueryIO.Write.CreateDisposition.CREATE_IF_NEEDED)
+                        .withWriteDisposition(BigQueryIO.Write.WriteDisposition.WRITE_TRUNCATE));
 
         pipeline.run();
     }
@@ -57,28 +70,12 @@ public class CountCatsDogs {
 
         void setInput(String value);
 
-        @Description("Text file to write to")
-        @Default.InstanceFactory(OutputFactory.class)
+        @Description("BigQuery table to write to, specified as "
+                + "<project_id>:<dataset_id>.<table_id>. The dataset must already exist.")
+        @Default.String(REDDIT_IMGUR_CATS_DOGS_RES)
         String getOutput();
 
         void setOutput(String value);
-
-        /**
-         * Copied from Google examples https://github.com/GoogleCloudPlatform/DataflowJavaSDK-examples
-         * Returns "gs://${YOUR_STAGING_DIRECTORY}/counts.txt" as the default destination.
-         */
-        public static class OutputFactory implements DefaultValueFactory<String> {
-            @Override
-            public String create(PipelineOptions options) {
-                DataflowPipelineOptions dataflowOptions = options.as(DataflowPipelineOptions.class);
-                if (dataflowOptions.getStagingLocation() != null) {
-                    return GcsPath.fromUri(dataflowOptions.getStagingLocation())
-                            .resolve("counts.txt").toString();
-                } else {
-                    throw new IllegalArgumentException("Must specify --output or --stagingLocation");
-                }
-            }
-        }
     }
 
     /**
@@ -93,29 +90,45 @@ public class CountCatsDogs {
     }
 
 
-    private static class GetUrls extends com.google.cloud.dataflow.sdk.transforms.DoFn<TableRow, URL> {
+    public static class GetUrls extends com.google.cloud.dataflow.sdk.transforms.DoFn<TableRow, URL> {
+
+        public static final String IMGUR_BASEURL = "http://i.imgur.com/";
+
         @Override
         public void processElement(ProcessContext processContext) throws Exception {
-            final String res = processContext.element().getF().get(0).getV().toString();
+            final TableRow row = processContext.element();
+            String res = (String) row.get("url");
             try {
-                final URL url = new URL(res + ".png");
+                if (!res.contains("i.imgur.com")) {
+                    final String[] split = res.split("/");
+                    res = IMGUR_BASEURL + split[split.length - 1] + ".png";
+                }
+                final URL url = new URL(res);
                 processContext.output(url);
-            } catch (MalformedURLException e) {
+            } catch (Exception e) {
                 //No output
             }
         }
     }
 
-    private static class GetLabels extends com.google.cloud.dataflow.sdk.transforms.DoFn<URL, String> {
+    public static class GetLabels extends com.google.cloud.dataflow.sdk.transforms.DoFn<URL, String> {
 
 
         @Override
         public void processElement(ProcessContext processContext) throws Exception {
             final Vision vision = connect(processContext.getPipelineOptions().as(Options.class).getProject());
             final URL url = processContext.element();
-            final byte[] imageBytes = getImageBytes(url);
-            final List<EntityAnnotation> entityAnnotations = labelImage(vision, imageBytes);
-            entityAnnotations.forEach((a) -> processContext.output(a.getDescription()));
+            List<EntityAnnotation> entityAnnotations = new ArrayList<>();
+            try {
+                final byte[] imageBytes = getImageBytes(url);
+                entityAnnotations = labelImage(vision, imageBytes);
+            } catch (Exception e) {
+                //skip it
+            }
+
+            for (EntityAnnotation a : entityAnnotations) {
+                processContext.output(a.getDescription());
+            }
         }
 
         private byte[] getImageBytes(URL url) throws IOException {
@@ -171,9 +184,9 @@ public class CountCatsDogs {
         }
     }
 
-    private static class CountLabels extends com.google.cloud.dataflow.sdk.transforms.PTransform<PCollection<TableRow>, PCollection<KV<String, Long>>> {
+    public static class CountLabels extends com.google.cloud.dataflow.sdk.transforms.PTransform<PCollection<TableRow>, PCollection<TableRow>> {
         @Override
-        public PCollection<KV<String, Long>> apply(PCollection<TableRow> input) {
+        public PCollection<TableRow> apply(PCollection<TableRow> input) {
 
             //images urls
             final PCollection<URL> urls = input.apply(ParDo.of(new GetUrls()));
@@ -183,9 +196,22 @@ public class CountCatsDogs {
 
             // Count the number of times each word occurs.
             final PCollection<KV<String, Long>> wordCounts =
-                    labels.apply(Count.perElement());
+                    labels.apply(Count.<String>perElement());
 
-            return wordCounts;
+            //Get resulting rows
+            final PCollection<TableRow> res = wordCounts.apply(ParDo.of(new ToRow()));
+
+            return res;
+        }
+
+        private class ToRow extends DoFn<KV<String, Long>, TableRow> {
+            @Override
+            public void processElement(ProcessContext c) throws Exception {
+                TableRow row = new TableRow()
+                        .set("description", c.element().getKey())
+                        .set("count", c.element().getValue());
+                c.output(row);
+            }
         }
     }
 }
