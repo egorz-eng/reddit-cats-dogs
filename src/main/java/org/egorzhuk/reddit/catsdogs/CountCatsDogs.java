@@ -17,7 +17,6 @@ import com.google.cloud.dataflow.sdk.options.Default;
 import com.google.cloud.dataflow.sdk.options.Description;
 import com.google.cloud.dataflow.sdk.options.PipelineOptionsFactory;
 import com.google.cloud.dataflow.sdk.repackaged.com.google.common.collect.ImmutableList;
-import com.google.cloud.dataflow.sdk.transforms.Count;
 import com.google.cloud.dataflow.sdk.transforms.DoFn;
 import com.google.cloud.dataflow.sdk.transforms.ParDo;
 import com.google.cloud.dataflow.sdk.values.KV;
@@ -90,13 +89,14 @@ public class CountCatsDogs {
     }
 
 
-    public static class GetUrls extends com.google.cloud.dataflow.sdk.transforms.DoFn<TableRow, URL> {
+    public static class GetUrls extends com.google.cloud.dataflow.sdk.transforms.DoFn<TableRow, KV<URL, Long>> {
 
         public static final String IMGUR_BASEURL = "http://i.imgur.com/";
 
         @Override
         public void processElement(ProcessContext processContext) throws Exception {
             final TableRow row = processContext.element();
+            Long score = Long.valueOf((String) row.get("score"));
             String res = (String) row.get("url");
             try {
                 if (!res.contains("i.imgur.com")) {
@@ -104,20 +104,21 @@ public class CountCatsDogs {
                     res = IMGUR_BASEURL + split[split.length - 1] + ".png";
                 }
                 final URL url = new URL(res);
-                processContext.output(url);
+                processContext.output(KV.of(url, score));
             } catch (Exception e) {
                 //No output
             }
         }
     }
 
-    public static class GetLabels extends com.google.cloud.dataflow.sdk.transforms.DoFn<URL, String> {
+    public static class GetLabels extends com.google.cloud.dataflow.sdk.transforms.DoFn<KV<URL, Long>, KV<String, Long>> {
 
 
         @Override
         public void processElement(ProcessContext processContext) throws Exception {
             final Vision vision = connect(processContext.getPipelineOptions().as(Options.class).getProject());
-            final URL url = processContext.element();
+            final URL url = processContext.element().getKey();
+            final Long score = processContext.element().getValue();
             List<EntityAnnotation> entityAnnotations = new ArrayList<>();
             try {
                 final byte[] imageBytes = getImageBytes(url);
@@ -127,7 +128,7 @@ public class CountCatsDogs {
             }
 
             for (EntityAnnotation a : entityAnnotations) {
-                processContext.output(a.getDescription());
+                processContext.output(KV.of(a.getDescription(), score));
             }
         }
 
@@ -164,7 +165,7 @@ public class CountCatsDogs {
                                             .setMaxResults(5)));
             Vision.Images.Annotate annotate =
                     vision.images()
-                            .annotate(new BatchAnnotateImagesRequest().setRequests(ImmutableList.of(request)));
+                          .annotate(new BatchAnnotateImagesRequest().setRequests(ImmutableList.of(request)));
             // Due to a bug: requests to Vision API containing large images fail when GZipped.
             annotate.setDisableGZipContent(true);
             // [END construct_request]
@@ -189,17 +190,17 @@ public class CountCatsDogs {
         public PCollection<TableRow> apply(PCollection<TableRow> input) {
 
             //images urls
-            final PCollection<URL> urls = input.apply(ParDo.of(new GetUrls()));
+            final PCollection<KV<URL, Long>> urls = input.apply(ParDo.of(new GetUrls()));
 
             //cloud vision labels
-            final PCollection<String> labels = urls.apply(ParDo.of(new GetLabels()));
+            final PCollection<KV<String, Long>> labels = urls.apply(ParDo.of(new GetLabels()));
 
-            // Count the number of times each word occurs.
+            /*// Count the number of times each word occurs.
             final PCollection<KV<String, Long>> wordCounts =
-                    labels.apply(Count.<String>perElement());
+                    labels.apply(Count.<String>perElement());*/
 
             //Get resulting rows
-            final PCollection<TableRow> res = wordCounts.apply(ParDo.of(new ToRow()));
+            final PCollection<TableRow> res = labels.apply(ParDo.of(new ToRow()));
 
             return res;
         }
