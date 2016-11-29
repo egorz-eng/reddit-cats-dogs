@@ -4,6 +4,7 @@ import com.google.api.client.googleapis.auth.oauth2.GoogleCredential;
 import com.google.api.client.googleapis.javanet.GoogleNetHttpTransport;
 import com.google.api.client.json.jackson2.JacksonFactory;
 import com.google.api.client.util.IOUtils;
+import com.google.api.client.util.StringUtils;
 import com.google.api.services.bigquery.model.TableFieldSchema;
 import com.google.api.services.bigquery.model.TableRow;
 import com.google.api.services.bigquery.model.TableSchema;
@@ -127,9 +128,11 @@ public class CountCatsDogs {
                 //skip it
             }
 
+            StringBuilder builder = new StringBuilder();
             for (EntityAnnotation a : entityAnnotations) {
-                processContext.output(KV.of(a.getDescription(), score));
+                builder.append(a.getDescription()).append(" ");
             }
+            processContext.output(KV.of(builder.toString(), score));
         }
 
         private byte[] getImageBytes(URL url) throws IOException {
